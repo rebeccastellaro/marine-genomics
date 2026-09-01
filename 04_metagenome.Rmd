@@ -1,0 +1,270 @@
+---
+title: "workshop4_BBD.Rmd"
+output: html_document
+date: "2026-07-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+This one's looking at the black band disease (BBD) metagenome — samples came from coral (*Acropora hyacynthus*) at Orpheus Island, collected by PhD student Julia Hung and sequenced on a MinION. Basically the goal is: assemble the reads, split the contigs into separate genomes with metabat2, then try to figure out what's actually going on metabolically in the BBD community.
+
+This is the one that actually gets assessed on GitHub, so everything's going into `marine-genomics`, committed as I go.
+
+## Step 1: Document your work
+
+Doing one Rmd per step, like `01_assembly.Rmd`, `01_binning.Rmd`, `02_checkm.Rmd`, and linking them from the README.
+
+## Step 2: Assembly
+
+```bash
+mkdir flye
+cd flye
+ln -s /pvol/data/metagenome_assembly/bbd_0.1.fastq.gz .
+```
+
+`run_flye_bbd.sh`:
+
+```bash
+#!/bin/bash
+#SBATCH --time=720
+#SBATCH --ntasks=12 --mem=10gb
+
+echo "Starting flye bbd in $(pwd) at $(date)"
+
+flye --nano-hq bbd_0.1.fastq.gz --threads 12 --out-dir bbd --meta
+
+echo "Finished flye bbd in $(pwd) at $(date)"
+```
+
+```bash
+sbatch run_flye_bbd.sh
+```
+
+Only committing the shell script — the actual flye output is way too big for git.
+
+The assembly spat out thousands of contigs (`assembly_info.txt` had over 8000 lines), which makes sense since this is a real community, not the simple 5-species mock one from Workshop 3. Most of them are tiny and low coverage — basically the rare stuff that's hard to fully assemble. But one contig clearly stands out: `contig_119`, 4,706,701 bp, 91x coverage, and marked circular — meaning Flye closed it into a full loop, which is a good sign it's a high-quality, abundant genome. And yeah, checkM backed that up later — 97.62% complete.
+
+## Step 3: Binning with metabat
+
+```bash
+cd ~/marine-genomics
+mkdir metabat
+cd metabat
+
+# Extract depth information
+cat ../flye/bbd/assembly_info.txt | grep -v '#' | awk '{OFS="\t";print $1,$3}' > depths_bbd.txt
+
+# Reorder contigs to match depths file
+cat depths_bbd.txt | awk '{print $1}' | xargs samtools faidx ../flye/bbd/assembly.fasta > assembly_bbd_ordered.fasta
+
+# Run metabat2
+metabat2 -i assembly_bbd_ordered.fasta -a depths_bbd.txt --cvExt -o bins_bbd/metabat --seed 5
+```
+
+Ended up with 71 bins total — `metabat.1` through `metabat.70`, plus `contig_119` which I had to add in manually since metabat skips the biggest/highest-coverage contig by default (workbook said this would happen, and yep, it did).
+
+## Step 4: Check bin quality with checkM
+
+```bash
+cd ~/marine-genomics
+mkdir checkm
+cd checkm
+mkdir bins_bbd
+cp ../metabat/bins_bbd/*.fa bins_bbd/
+
+# Find the largest contig (usually excluded by metabat, needs manual addition)
+cat ../flye/bbd/assembly.fasta | bioawk -c fastx '{print length($seq),$name}' | sort -n
+
+# Substitute the actual largest contig name below
+samtools faidx ../flye/bbd/assembly.fasta contig_XX > bins_bbd/contig_XX.fa
+```
+
+`run_checkm_bbd.sh`:
+
+```bash
+#!/bin/bash
+#SBATCH --time=60
+#SBATCH --ntasks=6 --mem=40gb
+
+echo "Starting checkm in $(pwd) at $(date)"
+
+shopt -s expand_aliases
+alias checkm='apptainer run -B /pvol/:/pvol /pvol/data/sif/checkm.sif checkm'
+
+checkm lineage_wf bins_bbd out -t 4 -x fa -f checkm_results_bbd.txt
+
+echo "Finished checkm in $(pwd) at $(date)"
+```
+
+```bash
+sbatch run_checkm_bbd.sh
+```
+
+<!-- backup if steps 1-4 don't finish in time:
+mkdir -p flye metabat checkm
+cd flye/ && ln -s /pvol/data/mg/bbd/flye/bbd . && cd ..
+cd metabat && ln -s /pvol/data/mg/bbd/metabat/bins_bbd . && cd ..
+cd checkm && ln -s /pvol/data/mg/bbd/checkm/checkm_results_bbd.txt . && cd ..
+-->
+
+## Functional Analysis of the BBD Metagenome
+
+Basically trying to answer two things now: who's actually in this community, and what can they do (genes/pathways-wise).
+
+### Step 5: Select bins based on checkM results
+
+```bash
+cd checkm
+head -n 20 checkm_results_bbd.txt
+```
+
+Only keeping bins above 15% completeness — these are the ones actually worth looking at, and probably the more abundant/better-assembled members anyway.
+
+```bash
+cat checkm_results_bbd.txt | awk '$13>15{print $1}' > bbd_topbins.txt
+```
+
+19 bins made the cut: `contig_119`, `metabat.63`, `metabat.8`, `metabat.31`, `metabat.45`, `metabat.48`, `metabat.47`, `metabat.18`, `metabat.36`, `metabat.2`, `metabat.7`, `metabat.67`, `metabat.27`, `metabat.25`, `metabat.35`, `metabat.64`, `metabat.10`, `metabat.69`, `metabat.49`.
+
+Two of them are basically fully complete genomes — `contig_119` (97.62%, 1.64% contamination) and `metabat.63` (97.56%, 0.67% contamination). Contamination across the board is basically nothing, so metabat did a decent job here.
+
+### Step 6: Taxonomic classification with gtdbtk
+
+```bash
+mkdir gtdbtk
+cd gtdbtk
+mkdir genomes
+
+# Copy each top bin's fasta into genomes/
+while read bin; do cp "../metabat/bins_bbd/${bin}.fa" genomes; done < ../checkm/bbd_topbins.txt
+
+ls genomes
+```
+
+`run_gtdbtk.sh`:
+
+```bash
+#!/bin/bash
+#SBATCH --time=60
+#SBATCH --ntasks=2 --mem=40gb
+
+echo "Starting gtdbtk in $(pwd) at $(date)"
+
+shopt -s expand_aliases
+alias gtdbtk='apptainer run -B /pvol:/pvol,/pvol/data/mg/gtdbtkdata/release207_v2/:/refdata /pvol/data/sif/gtdbtk.sif'
+
+gtdbtk classify_wf -x fa --cpus 2 --genome_dir genomes --out_dir out --skip_ani_screen
+
+echo "Finished gtdbtk in $(pwd) at $(date)"
+```
+
+```bash
+sbatch run_gtdbtk.sh
+```
+
+Main things I found in `out/gtdbtk.bac120.summary.tsv`:
+
+| Bin | Classification | Notes |
+|---|---|---|
+| `metabat.63` | *p__Cyanobacteria; g__Roseofilum; s__Roseofilum reptotaenium_A* | 96.68% ANI, and *Roseofilum* is actually a known BBD cyanobacterium |
+| `contig_119` | *p__Bacteroidota; o__Cytophagales; f__Bernardetiaceae* | 98.71% ANI, near-complete |
+| `metabat.2`, `metabat.36`, `metabat.47`, `metabat.48`, `metabat.67` | *p__Desulfobacterota* group (mostly *Maridesulfovibrio*) | this is the sulfate-reducer group, just not literally *Desulfovibrio* |
+| `metabat.8`, `metabat.31`, `metabat.35`, `metabat.45` | *p__Campylobacterota* (*Halarcobacter*, *Poseidonibacter*) | a bunch of bins landed here |
+| `metabat.10`, `metabat.25` | Unclassified | too fragmented (under 10% of the MSA) to call confidently |
+
+So `metabat.63` coming back as an actual cyanobacterium lines up with what the BBD model says — that cyanobacteria are the ones doing the photosynthesis.
+
+### Step 7: Find and annotate genes with prokka
+
+Tried it on one bin first to see how it worked:
+
+```bash
+mkdir prokka
+cd prokka
+
+head -n 1 ../checkm/bbd_topbins.txt
+# substitute your actual first bin ID below
+bin=metabat.5
+prokka --outdir $bin --prefix $bin ../metabat/bins_bbd/${bin}.fa
+```
+
+Then ran it properly across all the top bins with a slurm script — `run_prokka.sh`:
+
+```bash
+#!/bin/bash
+#SBATCH --time=60
+#SBATCH --ntasks=2 --mem=2gb
+
+echo "Starting prokka in $(pwd) at $(date)"
+
+shopt -s expand_aliases
+alias prokka='apptainer run -B /pvol/:/pvol /pvol/data/sif/prokka.sif prokka'
+
+while read bin; do
+  prokka --outdir $bin --prefix $bin "../metabat/bins_bbd/${bin}.fa";
+done < ../checkm/bbd_topbins.txt
+
+echo "Finished prokka in $(pwd) at $(date)"
+```
+
+```bash
+sbatch run_prokka.sh
+```
+
+### Step 8: Infer metabolic pathways with minpath
+
+```bash
+mkdir minpath
+cd minpath
+
+# Prepare minpath input for all bins - keep gene ID + EC number only
+while read bin; do
+  cat ../prokka/$bin/${bin}.tsv | awk -F '\t' '$5{printf("%s\t%s\n", $1,$5)}' | grep -v '^locus' > ${bin}.ec
+done < ../checkm/bbd_topbins.txt
+
+# Run minpath on every bin
+while read bin; do
+  minpath -ec ${bin}.ec -report ${bin}.ec.report -details ${bin}.ec.details
+done < ../checkm/bbd_topbins.txt
+```
+
+Going by the Sato et al. BBD model, cyanobacteria should be doing the photosynthesis, and *Desulfovibrio* (if it's well assembled) should be handling sulfate reduction.
+
+**Question 4.1 — photosynthesis light reactions (PWY-101)**
+
+```bash
+grep 'PWY-101' *.ec.report
+```
+
+```
+contig_119.ec.report:  fam0 4  fam-found 1
+metabat.18.ec.report:  fam0 4  fam-found 1
+metabat.2.ec.report:   fam0 4  fam-found 1
+metabat.47.ec.report:  fam0 4  fam-found 1
+metabat.63.ec.report:  fam0 4  fam-found 4
+```
+
+5 bins have at least one gene from this pathway, but only `metabat.63` has the whole thing (4 out of 4). Everyone else only has 1. And `metabat.63` is the same bin gtdbtk called as Cyanobacteria — so that's a pretty clean match, taxonomy and function both pointing the same direction.
+
+**Question 4.2 — superpathway of tetrathionate reduction (PWY-5360)**
+
+```bash
+grep 'PWY-5360' *.ec.report
+```
+
+```
+metabat.25.ec.report:  fam0 3  fam-found 1
+metabat.45.ec.report:  fam0 3  fam-found 1
+```
+
+Only 2 bins show up here — `metabat.25` and `metabat.45` — and neither has the full pathway, just 1 out of 3 each. `metabat.45` is Campylobacterota (*Halarcobacter*), and `metabat.25` is the unclassified one.
+
+This one didn't match what I expected. The bins that are actually closest taxonomically to the "sulfate reducer" role (the Desulfobacterota ones) don't show up here at all — none of them. Instead the only hits are in a completely different group, and even those are incomplete. Not sure if that's a real biological thing (maybe they're using a different pathway) or just an artifact of the bins being too fragmented to pick up the right genes.
+
+## Reflection
+
+This one felt a lot messier than the mock community in Workshop 3, which honestly makes sense, 71 bins came out of binning, but only 19 actually hit the 15% completeness bar, so most of what got assembled here is fragments, not real usable genomes. The cyanobacteria result was the clean win: gtdbtk called `metabat.63` as *Roseofilum*, and it's also the only bin with the complete photosynthesis pathway, so taxonomy and function agreed with each other and matched what the BBD model predicts. The sulfate-reduction side was more confusing because the bins that looked taxonomically like they should be doing that job didn't show any of the relevant genes at all, and the ones that did have some sulfur-pathway genes were in a totally different group and incomplete anyway. I think that's actually the more useful thing to have noticed, since it shows how a bin's assigned taxonomy and what genes actually show up in it don't always line up, especially when the genome itself is only partially assembled.
